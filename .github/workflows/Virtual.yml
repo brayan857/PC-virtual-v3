@@ -1,0 +1,105 @@
+name: RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. LIBERAR ESPACIO Y MONTAR DISCO EXTRA
+      # ─────────────────────────────────────────────
+      - name: Free Up Space & Mount Extra Disk
+        run: |
+          Write-Host "=== Disk before cleanup ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          $toRemove = @(
+            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
+            "$env:SystemDrive\hostedtoolcache\windows\go",
+            "$env:SystemDrive\hostedtoolcache\windows\Python",
+            "$env:ProgramFiles\dotnet",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "$env:ProgramFiles (x86)\Google\Chrome",
+            "$env:ProgramFiles\Mozilla Firefox"
+          )
+          foreach ($path in $toRemove) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removed: $path" -ForegroundColor Green
+            }
+          }
+
+          Write-Host "=== Disk D: info ===" -ForegroundColor Cyan
+          Get-PSDrive D -ErrorAction SilentlyContinue
+
+          $vhdPath = "D:\extra_disk.vhdx"
+          New-VHD -Path $vhdPath -SizeBytes 100GB -Dynamic -ErrorAction SilentlyContinue
+          Mount-VHD -Path $vhdPath
+          $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
+          if ($disk) {
+            Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru |
+              New-Partition -AssignDriveLetter -UseMaximumSize |
+              Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false
+          }
+
+          Write-Host "=== Disk after setup ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          "EXTRA_DISK=E:" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "STORAGE_ROOT=D:\storage" | Out-File -FilePath $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force -Path "D:\storage" | Out-Null
+
+      # ─────────────────────────────────────────────
+      # 3. CONFIGURAR RDP
+      # ─────────────────────────────────────────────
+      - name: Configure RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured." -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 4. CREAR USUARIO RDP
+      # ─────────────────────────────────────────────
+      - name: Create RDP User
+        run: |
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          }
+          $rawPassword  = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"        -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users"  -Member "RDP" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"; exit 1
+          }
+
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "RDP user created." -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
